@@ -1,0 +1,72 @@
+%option prefix="mydb"
+//%option debug-layer
+
+%header-preamble {
+    #include <stdint.h>
+}
+
+%source-includes {
+    #include "sqlite3.h"
+    #include "mydb.sqlgen.h"
+}
+
+%upgrade 1 {
+    CREATE TABLE IF NOT EXISTS people (
+        id INTEGER PRIMARY KEY NOT NULL,
+        first_name TEXT NOT NULL,
+        last_name TEXT NOT NULL,
+        UNIQUE(first_name, LAST_NAME));
+}
+%upgrade 2 {
+    CREATE TABLE pets (
+        id INTEGER PRIMARY KEY NOT NULL,
+        name TEXT NOT NULL,
+        fave_food TEXT NOT NULL,
+        UNIQUE(name));
+    CREATE TABLE owned_pets (
+        person_id INTEGER NOT NULL,
+        pet_id INTEGER NOT NULL,
+        UNIQUE(person_id, pet_id));
+}
+%downgrade 1 {
+    DROP TABLE IF EXISTS owned_pets;
+    DROP TABLE IF EXISTS pets;
+}
+%downgrade 0 {
+    DROP TABLE IF EXISTS people;
+}
+
+%query example,add(const char* name null, uint32_t age null) {
+    type insert
+    table test
+}
+%query example,get() {
+    type select-all
+    table test
+    callback const char* name null, uint32_t age null
+}
+
+%query person,add_or_get(const char* first_name, const char* last_name) {
+    type insert
+    table people
+    return id
+}
+%query person,associate_pet(int person_id, int pet_id) {
+    type insert
+    table owned_pets
+}
+%query pet,add_or_get(const char* name, const char* fave_food) {
+    type insert
+    table pets
+    return id
+}
+%query person,get_pet_names(const char* first_name, const char* last_name) {
+    type select-all
+    stmt {
+        SELECT name, fave_food FROM people
+        JOIN owned_pets ON owned_pets.person_id=people.id
+        JOIN pets ON owned_pets.pet_id=pets.id
+        WHERE first_name=? AND last_name=?
+    }
+    callback const char* name, const char* fave_food
+}
