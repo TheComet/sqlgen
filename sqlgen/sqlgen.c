@@ -2456,7 +2456,7 @@ write_migration_body(struct mstream* ms, const struct root* root, const char* da
                         else if (c == '"')
                             mstream_putc(ms, '\\');
                         else if (c == '\\')
-                            mstream_putc(ms, '\\');
+                            mstream_cstr(ms, "\\\\\\");
                         else if (c == '\r')
                             continue;
                         else if (c == '\n')
