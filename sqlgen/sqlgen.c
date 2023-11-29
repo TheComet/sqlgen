@@ -430,6 +430,7 @@ struct cfg
     unsigned custom_deinit_decl : 1;
     unsigned custom_api         : 1;
     unsigned custom_api_decl    : 1;
+    unsigned no_forwards_compat : 1;
 };
 
 static int
@@ -992,6 +993,8 @@ parse(struct parser* p, struct root* root, struct cfg* cfg)
                     { cfg->custom_api = 1; cfg->custom_api_decl = 1; break; }
                 else if (str_eq_cstr("custom-api-decl", option, p->data))
                     { cfg->custom_api_decl = 1; break; }
+                else if (str_eq_cstr("no-forwards-compat", option, p->data))
+                    { cfg->no_forwards_compat = 1; break; }
 
                 if (scan_next_token(p) != '=')
                     return print_error(p, "Error: Expecting '='\n");
@@ -2176,19 +2179,21 @@ write_migration_sql_stmts(struct mstream* ms, const struct root* root, const str
     while (m)
     {
         int p;
-        mstream_fmt(ms, "static const char %S_%s%d[] =" NL, PREFIX(root->prefix, data), type, m->version);
+        mstream_fmt(ms, "static const char* %S_%s%d =" NL, PREFIX(root->prefix, data), type, m->version);
         mstream_cstr(ms, "    \"");
         for (p = 0; p != m->sql.len; ++p)
         {
             if (data[m->sql.off + p] == '\n')
             {
                 if (p + 1 < m->sql.len)
-                    mstream_cstr(ms, " \"" NL "    \"");
+                    mstream_cstr(ms, "\\n\"" NL "    \"");
             }
             else if (data[m->sql.off + p] != '\r')
             {
                 char c = data[m->sql.off + p];
                 if (c == '"')
+                    mstream_putc(ms, '\\');
+                else if (c == '\\')
                     mstream_putc(ms, '\\');
                 mstream_putc(ms, c);
             }
@@ -2269,7 +2274,63 @@ write_version_func(struct mstream* ms, const struct root* root, const char* data
 }
 
 static void
-write_migration_body(struct mstream* ms, const struct root* root, const char* data, char reinit_db)
+write_downgrade_forward_compat_func(struct mstream* ms, const struct root* root, const char* data)
+{
+    mstream_fmt(ms, "static int %S_downgrade_forward_compat(sqlite3* db)" NL "{" NL,
+        PREFIX(root->prefix, data));
+    mstream_cstr(ms, "    int ret, i;" NL);
+    mstream_cstr(ms, "    sqlite3_stmt* stmt;" NL);
+    mstream_cstr(ms, "    const char* str;" NL);
+    mstream_cstr(ms, "    void* tmp;" NL);
+    mstream_cstr(ms, "    char** sql = NULL;" NL);
+    mstream_cstr(ms, "    int sql_num = 0;" NL);
+    mstream_cstr(ms, "    int success = -1;" NL);
+    mstream_fmt (ms, "    ret = sqlite3_prepare_v2(db, \"SELECT sql FROM %S_downgrades WHERE version >= %d ORDER BY version DESC;\", -1, &stmt, NULL);" NL,
+        PREFIX(root->prefix, data), root->downgrade ? root->downgrade->version + 1 : 0);
+    mstream_cstr(ms, "    if (ret != SQLITE_OK)" NL "    {" NL);
+    mstream_fmt (ms, "        %S(ret, sqlite3_errstr(ret), sqlite3_errmsg(db));" NL,
+        LOG_SQL_ERR(root->log_sql_err, data));
+    mstream_fmt (ms, "        return -1;" NL);
+    mstream_fmt (ms, "    }" NL NL);
+
+    mstream_cstr(ms, "next_step:" NL);
+    mstream_cstr(ms, "    ret = sqlite3_step(stmt);" NL);
+    mstream_cstr(ms, "    switch (ret)" NL "    {" NL);
+    mstream_cstr(ms, "        case SQLITE_ROW:" NL);
+    mstream_cstr(ms, "            tmp = realloc(sql, sizeof(char*) * (sql_num + 1));" NL);
+    mstream_cstr(ms, "            if (tmp == NULL) goto done;" NL);
+    mstream_cstr(ms, "            sql = tmp;" NL NL);
+    mstream_cstr(ms, "            str = (const char*)sqlite3_column_text(stmt, 0);" NL);
+    mstream_cstr(ms, "            sql[sql_num] = malloc(strlen(str) + 1);" NL);
+    mstream_cstr(ms, "            if (sql[sql_num] == NULL) goto done;" NL);
+    mstream_cstr(ms, "            strcpy(sql[sql_num++], str);" NL NL);
+    mstream_cstr(ms, "            goto next_step;" NL);
+    mstream_cstr(ms, "        case SQLITE_BUSY: goto next_step;" NL);
+    mstream_cstr(ms, "        case SQLITE_DONE:" NL);
+    mstream_cstr(ms, "            for (i = 0; i != sql_num; ++i)" NL);
+    mstream_cstr(ms, "            {" NL);
+    mstream_cstr(ms, "                if (run_sqlite3_sql(db, sql[i]) != 0)" NL);
+    mstream_cstr(ms, "                    goto done;" NL);
+    mstream_cstr(ms, "            }" NL);
+    mstream_cstr(ms, "            success = 0;" NL);
+    mstream_cstr(ms, "            goto done;" NL);
+    mstream_cstr(ms, "    }" NL NL);
+
+    mstream_fmt (ms, "    %S(ret, sqlite3_errstr(ret), sqlite3_errmsg(db));" NL,
+        LOG_SQL_ERR(root->log_sql_err, data));
+    mstream_cstr(ms, "done:" NL);
+    mstream_cstr(ms, "    for (i = 0; i != sql_num; ++i)" NL);
+    mstream_cstr(ms, "        if (sql[i])" NL);
+    mstream_cstr(ms, "            free(sql[i]);" NL);
+    mstream_cstr(ms, "    if (sql)" NL);
+    mstream_cstr(ms, "        free(sql);" NL);
+    mstream_cstr(ms, "    sqlite3_reset(stmt);" NL);
+    mstream_cstr(ms, "    return success;" NL);
+    mstream_cstr(ms, "}" NL NL);
+}
+
+static void
+write_migration_body(struct mstream* ms, const struct root* root, const char* data, char reinit_db, char no_forwards_compat)
 {
     int max_version = 0;
     struct migration* m;
@@ -2287,10 +2348,12 @@ write_migration_body(struct mstream* ms, const struct root* root, const char* da
     if (!reinit_db)
         mstream_cstr(ms, "    char buf[sizeof(\"PRAGMA user_version=+2147483648;\")];" NL NL);
 
+    /* Get current db version */
     mstream_fmt (ms, "    version = %S_version(ctx);" NL, PREFIX(root->prefix, data));
     mstream_cstr(ms, "    if (version < 0)" NL);
     mstream_cstr(ms, "        return -1;" NL NL);
 
+    /* Begin transaction */
     mstream_cstr(ms, "    ret = sqlite3_exec(ctx->db, \"BEGIN TRANSACTION;\", NULL, NULL, &error);" NL);
     mstream_cstr(ms, "    if (ret != SQLITE_OK)" NL "    {" NL);
     mstream_fmt (ms, "        %S(ret, error, sqlite3_errmsg(ctx->db));" NL, LOG_SQL_ERR(root->log_sql_err, data));
@@ -2298,8 +2361,25 @@ write_migration_body(struct mstream* ms, const struct root* root, const char* da
     mstream_cstr(ms, "        return -1;" NL);
     mstream_cstr(ms, "    }" NL NL);
 
+    /* Downgrade code */
     mstream_cstr(ms, "    switch (version)" NL "    {" NL);
     mstream_cstr(ms, "        default:" NL);
+    if (no_forwards_compat)
+    {
+        mstream_fmt(ms, "            %S(\"Database was created by a newer version of the software! "
+            "Can't downgrade, because forwards compatibility was disabled in sqlgen.\");" NL,
+            LOG_ERR(root->log_err, data));
+        mstream_cstr(ms, "            goto migration_failed;" NL);
+    }
+    else
+    {
+        mstream_fmt (ms, "            if (%S_downgrade_forward_compat(ctx->db) != 0)" NL,
+            PREFIX(root->prefix, data));
+        mstream_fmt (ms, "                goto migration_failed;" NL);
+        mstream_fmt (ms, "            version = %d;" NL,
+            root->downgrade ? root->downgrade->version + 1 : 0);
+    }
+
     m = root->downgrade;
     while (m)
     {
@@ -2309,14 +2389,25 @@ write_migration_body(struct mstream* ms, const struct root* root, const char* da
             mstream_cstr(ms, "            if (version == target_version)" NL);
             mstream_cstr(ms, "                break;" NL);
         }
-        mstream_fmt (ms, "            if (run_sqlite3_sql(ctx->db, %S_downgrade%d) != 0)" NL, PREFIX(root->prefix, data), m->version);
+        mstream_fmt (ms, "            if (run_sqlite3_sql(ctx->db, %S_downgrade%d) != 0)" NL,
+            PREFIX(root->prefix, data), m->version);
         mstream_cstr(ms, "                goto migration_failed;" NL);
+
+        if (!no_forwards_compat && m->version == 0)
+        {
+            mstream_fmt (ms, "            if (run_sqlite3_sql(ctx->db, \"DROP TABLE IF EXISTS %S_downgrades;\") != 0)" NL,
+                PREFIX(root->prefix, data));
+            mstream_cstr(ms, "                goto migration_failed;" NL);
+        }
+
         mstream_fmt (ms, "            version = %d;" NL, m->version);
         m = m->next;
     }
-    mstream_cstr(ms, "        case 0: break;" NL);
+    mstream_cstr(ms, "        case 0:" NL);
+    mstream_cstr(ms, "            break;" NL);
     mstream_cstr(ms, "    }" NL NL);
 
+    /* Upgrade code */
     mstream_cstr(ms, "    switch (version)" NL "    {" NL);
     m = root->upgrade;
     while (m)
@@ -2326,6 +2417,64 @@ write_migration_body(struct mstream* ms, const struct root* root, const char* da
         {
             mstream_cstr(ms, "            if (version == target_version)" NL);
             mstream_cstr(ms, "                break;" NL);
+        }
+
+        /* The first migration also includes forward-compat code */
+        if (!no_forwards_compat && m->version == 1)
+        {
+            struct migration* m2;
+            mstream_cstr(ms, "            if (run_sqlite3_sql(ctx->db," NL);
+            mstream_fmt (ms, "                \"CREATE TABLE IF NOT EXISTS %S_downgrades (\\n\"" NL,
+                PREFIX(root->prefix, data));
+            mstream_cstr(ms, "                \"    version INTEGER PRIMARY KEY NOT NULL,\\n\"" NL);
+            mstream_cstr(ms, "                \"    sql TEXT NOT NULL);\\n\"");
+
+            m2 = root->downgrade;
+            while (m2)
+            {
+                int p;
+
+                mstream_fmt(ms, NL "                "
+                    "\"INSERT OR IGNORE INTO %S_downgrades (version, sql) "
+                    "VALUES (%d, '",
+                    PREFIX(root->prefix, data), m2->version);
+
+                p = 0;
+                while (p != m2->sql.len)
+                {
+                    while (isspace(data[m2->sql.off + p]))
+                        p++;
+
+                    mstream_cstr(ms, "\"" NL "                    \"");
+                    while (p != m2->sql.len)
+                    {
+                        char c = data[m2->sql.off + p++];
+                        /* Escape SQL for insertion into table */
+                        if (c == '\'')
+                            mstream_putc(ms, '\'');
+                        /* Escape SQL for C string */
+                        else if (c == '"')
+                            mstream_putc(ms, '\\');
+                        else if (c == '\\')
+                            mstream_putc(ms, '\\');
+                        else if (c == '\r')
+                            continue;
+                        else if (c == '\n')
+                        {
+                            mstream_cstr(ms, "\\\\n");
+                            break;
+                        }
+                        mstream_putc(ms, c);
+                    }
+                }
+
+                mstream_cstr(ms, "');\\n\"");
+
+                m2 = m2->next;
+            }
+            //mstream_cstr(ms, NL "                    \"');\"");
+            mstream_cstr(ms, ") != 0)" NL);
+            mstream_cstr(ms, "                goto migration_failed;" NL);
         }
         mstream_fmt(ms, "            if (run_sqlite3_sql(ctx->db, %S_upgrade%d) != 0)" NL, PREFIX(root->prefix, data), m->version);
         mstream_cstr(ms, "                goto migration_failed;" NL);
@@ -2338,6 +2487,7 @@ write_migration_body(struct mstream* ms, const struct root* root, const char* da
     mstream_cstr(ms, "            goto migration_failed;" NL);
     mstream_cstr(ms, "    }" NL NL);
 
+    /* Write new version to db */
     if (reinit_db)
         mstream_fmt(ms, "    ret = sqlite3_exec(ctx->db, \"PRAGMA user_version=%d;\", NULL, NULL, &error);" NL, max_version);
     else
@@ -2351,6 +2501,7 @@ write_migration_body(struct mstream* ms, const struct root* root, const char* da
     mstream_cstr(ms, "        goto migration_failed;" NL);
     mstream_cstr(ms, "    }" NL NL);
 
+    /* Commit transaction */
     mstream_cstr(ms, "    ret = sqlite3_exec(ctx->db, \"COMMIT TRANSACTION;\", NULL, NULL, &error);" NL);
     mstream_cstr(ms, "    if (ret != SQLITE_OK)" NL "    {" NL);
     mstream_fmt (ms, "        %S(ret, error, sqlite3_errmsg(ctx->db));" NL, LOG_SQL_ERR(root->log_sql_err, data));
@@ -2360,6 +2511,7 @@ write_migration_body(struct mstream* ms, const struct root* root, const char* da
 
     mstream_cstr(ms, "    return 0;" NL NL);
 
+    /* Abort transaction */
     mstream_cstr(ms, "migration_failed:" NL);
     mstream_cstr(ms, "    ret = sqlite3_exec(ctx->db, \"ROLLBACK TRANSACTION;\", NULL, NULL, &error);" NL);
     mstream_cstr(ms, "    if (ret != SQLITE_OK)" NL "    {" NL);
@@ -2370,10 +2522,10 @@ write_migration_body(struct mstream* ms, const struct root* root, const char* da
 }
 
 static void
-write_migration_to_func(struct mstream* ms, const struct root* root, const char* data)
+write_migration_to_func(struct mstream* ms, const struct root* root, const char* data, char no_forwards_compat)
 {
     mstream_fmt(ms, "static int %S_migrate_to(struct %S* ctx, int target_version)" NL "{" NL, PREFIX(root->prefix, data), PREFIX(root->prefix, data));
-    write_migration_body(ms, root, data, 0);
+    write_migration_body(ms, root, data, 0, no_forwards_compat);
     mstream_cstr(ms, "}" NL NL);
 }
 
@@ -2393,10 +2545,10 @@ write_upgrade_func(struct mstream* ms, const struct root* root, const char* data
 }
 
 static void
-write_reinit_func(struct mstream* ms, const struct root* root, const char* data)
+write_reinit_func(struct mstream* ms, const struct root* root, const char* data, char no_forwards_compat)
 {
     mstream_fmt(ms, "static int %S_reinit(struct %S* ctx)" NL "{" NL, PREFIX(root->prefix, data), PREFIX(root->prefix, data));
-    write_migration_body(ms, root, data, 1);
+    write_migration_body(ms, root, data, 1, no_forwards_compat);
     mstream_cstr(ms, "}" NL NL);
 }
 
@@ -2789,7 +2941,7 @@ gen_header(const struct root* root, const char* data, const char* file_name,
 
 static int
 gen_source(const struct root* root, const char* data, const char* file_name,
-    char debug_layer, char custom_init, char custom_deinit, char custom_api)
+    char debug_layer, char custom_init, char custom_deinit, char custom_api, char no_forwards_compat)
 {
     struct query* q;
     struct query_group* g;
@@ -2801,6 +2953,7 @@ gen_source(const struct root* root, const char* data, const char* file_name,
     if (root->source_includes.len)
         mstream_fmt(&ms, NL "%S" NL NL, root->source_includes, data);
 
+    mstream_cstr(&ms, "#include <ctype.h>" NL);
     mstream_cstr(&ms, "#include <stdlib.h>" NL);
     mstream_cstr(&ms, "#include <string.h>" NL);
     mstream_cstr(&ms, "#include <stdio.h>" NL);
@@ -2999,9 +3152,11 @@ gen_source(const struct root* root, const char* data, const char* file_name,
     write_migration_sql_stmts(&ms, root, root->downgrade, data, "downgrade");
     write_run_sql_stmts_func(&ms, root, data);
     write_version_func(&ms, root, data);
-    write_migration_to_func(&ms, root, data);
+    if (!no_forwards_compat)
+        write_downgrade_forward_compat_func(&ms, root, data);
+    write_migration_to_func(&ms, root, data, no_forwards_compat);
     write_upgrade_func(&ms, root, data);
-    write_reinit_func(&ms, root, data);
+    write_reinit_func(&ms, root, data, no_forwards_compat);
 
     /* ------------------------------------------------------------------------
      * Interface
@@ -3097,7 +3252,7 @@ gen_source(const struct root* root, const char* data, const char* file_name,
         mstream_fmt (&ms, "    %S(\"Closing database\\n\");" NL, LOG_DBG(root->log_dbg, data));
         mstream_cstr(&ms, "    db_sqlite3.close(ctx);" NL);
         mstream_cstr(&ms, "}" NL NL);
-        
+
         mstream_fmt (&ms, "static int dbg_%S_version(struct %S* ctx)" NL "{" NL, PREFIX(root->prefix, data), PREFIX(root->prefix, data));
         mstream_cstr(&ms, "    int version;" NL);
         mstream_fmt (&ms, "    %S(\"Getting version...\\n\");" NL, LOG_DBG(root->log_dbg, data));
@@ -3113,7 +3268,7 @@ gen_source(const struct root* root, const char* data, const char* file_name,
         mstream_fmt (&ms, "    %S(\"retval=%%d\\n\", ret);" NL, LOG_DBG(root->log_dbg, data));
         mstream_cstr(&ms, "    return ret;" NL);
         mstream_cstr(&ms, "}" NL NL);
-        
+
         mstream_fmt (&ms, "static int dbg_%S_reinit(struct %S* ctx)" NL "{" NL, PREFIX(root->prefix, data), PREFIX(root->prefix, data));
         mstream_cstr(&ms, "    int ret;" NL);
         mstream_fmt (&ms, "    %S(\"Re-initializing db...\\n\");" NL, LOG_DBG(root->log_dbg, data));
@@ -3121,7 +3276,7 @@ gen_source(const struct root* root, const char* data, const char* file_name,
         mstream_fmt (&ms, "    %S(\"retval=%%d\\n\", ret);" NL, LOG_DBG(root->log_dbg, data));
         mstream_cstr(&ms, "    return ret;" NL);
         mstream_cstr(&ms, "}" NL NL);
-        
+
         mstream_fmt (&ms, "static int dbg_%S_migrate_to(struct %S* ctx, int target_version)" NL "{" NL, PREFIX(root->prefix, data), PREFIX(root->prefix, data));
         mstream_cstr(&ms, "    int ret;" NL);
         mstream_fmt (&ms, "    %S(\"Migrating db to version: %%d...\\n\", target_version);" NL, LOG_DBG(root->log_dbg, data));
@@ -3252,7 +3407,7 @@ int main(int argc, char** argv)
             cfg.custom_init_decl, cfg.custom_deinit_decl, cfg.custom_api_decl) < 0)
         return -1;
     if (gen_source(&root, mf.address, cfg.output_source,
-            cfg.debug_layer, cfg.custom_init, cfg.custom_deinit, cfg.custom_api) < 0)
+            cfg.debug_layer, cfg.custom_init, cfg.custom_deinit, cfg.custom_api, cfg.no_forwards_compat) < 0)
         return -1;
 
     return 0;

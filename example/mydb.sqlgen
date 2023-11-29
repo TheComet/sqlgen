@@ -18,12 +18,12 @@
         UNIQUE(first_name, LAST_NAME));
 }
 %upgrade 2 {
-    CREATE TABLE pets (
+    CREATE TABLE IF NOT EXISTS pets (
         id INTEGER PRIMARY KEY NOT NULL,
         name TEXT NOT NULL,
         fave_food TEXT NOT NULL,
         UNIQUE(name));
-    CREATE TABLE owned_pets (
+    CREATE TABLE IF NOT EXISTS owned_pets (
         person_id INTEGER NOT NULL,
         pet_id INTEGER NOT NULL,
         UNIQUE(person_id, pet_id));

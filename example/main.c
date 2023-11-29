@@ -15,7 +15,7 @@ int main(void)
     /* Global init. Must be called once during startup */
     if (mydb_init() != 0)
         goto init_db_failed;
-    
+
     /* Get pointer to interface -- this always succeeds */
     dbi = mydb("sqlite3");
 
@@ -25,7 +25,7 @@ int main(void)
         goto open_db_failed;
 
     /* Migrate to latest version if necessary */
-    if (dbi->upgrade(db) != 0)
+    if (dbi->migrate_to(db, 2) != 0)
         goto upgrade_db_failed;
     printf("DB version: %d\n", dbi->version(db));
 
