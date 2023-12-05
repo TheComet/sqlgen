@@ -47,9 +47,10 @@ macro (sqlgen_target name)
 
     string (REPLACE ";" "," _backends ${sqlgen_target_arg_BACKENDS})
 
+    get_filename_component (_output_path "${_output_header}" DIRECTORY)
     add_custom_command (OUTPUT ${_output_header} ${_output_source}
-        COMMAND sqlgen
-        ARGS -b ${_backends} -i ${_input_file} --header ${_output_header} --source ${_output_source}
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${_output_path}
+        COMMAND sqlgen -b ${_backends} -i ${_input_file} --header ${_output_header} --source ${_output_source}
         WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
         MAIN_DEPENDENCY ${_input_file}
         DEPENDS sqlgen
@@ -61,6 +62,7 @@ macro (sqlgen_target name)
         ${_output_header}
         ${_output_source})
 
+    unset (_output_path)
     unset (_backends)
     unset (_output_source)
     unset (_input_name)

@@ -4,6 +4,7 @@
 #define NL "\r\n"
 #else
 #define _GNU_SOURCE
+#include <errno.h>
 #include <unistd.h>
 #include <sys/fcntl.h>
 #include <sys/mman.h>
@@ -91,7 +92,7 @@ utf_free(void* utf)
 #endif
 
 static int
-mfile_map_read(struct mfile* mf, const char* file_name)
+mfile_map_read(struct mfile* mf, const char* file_name, int silence_open_error)
 {
 #if defined(WIN32)
     HANDLE hFile;
@@ -158,15 +159,29 @@ mfile_map_read(struct mfile* mf, const char* file_name)
 
     fd = open(file_name, O_RDONLY);
     if (fd < 0)
+    {
+        if (!silence_open_error)
+            fprintf(stderr, "Error: Failed to open file \"%s\": %s\n", file_name, strerror(errno));
         goto open_failed;
+    }
 
     if (fstat(fd, &stbuf) != 0)
+    {
+        fprintf(stderr, "Error: Failed to stat file \"%s\": %s\n", file_name, strerror(errno));
         goto fstat_failed;
+    }
     if (!S_ISREG(stbuf.st_mode))
+    {
+        fprintf(stderr, "Error: File \"%s\" is not a regular file!\n", file_name);
         goto fstat_failed;
+    }
+
     mf->address = mmap(NULL, (size_t)stbuf.st_size, PROT_READ, MAP_PRIVATE | MAP_NORESERVE, fd, 0);
     if (mf->address == MAP_FAILED)
+    {
+        fprintf(stderr, "Error: Failed to mmap() file \"%s\": %s\n", file_name, strerror(errno));
         goto mmap_failed;
+    }
 
     /* file descriptor no longer required */
     close(fd);
@@ -240,16 +255,26 @@ mfile_map_write(struct mfile* mf, const char* file_name, int size)
 #else
     int fd = open(file_name, O_CREAT|O_RDWR|O_TRUNC, S_IRUSR|S_IWUSR|S_IRGRP|S_IROTH);
     if (fd < 0)
+    {
+        fprintf(stderr, "Error: Failed to open file \"%s\" for writing: %s\n", file_name, strerror(errno));
         goto open_failed;
+    }
 
     /* When truncating the file, it must be expanded again, otherwise writes to
      * the memory will cause SIGBUS.
      * NOTE: If this ever gets ported to non-Linux, see posix_fallocate() */
     if (fallocate(fd, 0, 0, size) != 0)
+    {
+        fprintf(stderr, "Error: Failed to resize file \"%s\": %s\n", file_name, strerror(errno));
         goto mmap_failed;
+    }
+
     mf->address = mmap(NULL, (size_t)size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (mf->address == MAP_FAILED)
+    {
+        fprintf(stderr, "Error: Failed to mmap() file \"%s\" for writing: %s\n", file_name, strerror(errno));
         goto mmap_failed;
+    }
 
     /* file descriptor no longer required */
     close(fd);
@@ -2297,7 +2322,7 @@ write_downgrade_forward_compat_func(struct mstream* ms, const struct root* root,
     mstream_cstr(ms, "    ret = sqlite3_step(stmt);" NL);
     mstream_cstr(ms, "    switch (ret)" NL "    {" NL);
     mstream_cstr(ms, "        case SQLITE_ROW:" NL);
-    mstream_cstr(ms, "            tmp = realloc(sql, sizeof(char*) * (sql_num + 1));" NL);
+    mstream_cstr(ms, "            tmp = realloc(sql, sizeof(char*) * (size_t)(sql_num + 1));" NL);
     mstream_cstr(ms, "            if (tmp == NULL) goto done;" NL);
     mstream_cstr(ms, "            sql = tmp;" NL NL);
     mstream_cstr(ms, "            str = (const char*)sqlite3_column_text(stmt, 0);" NL);
@@ -2348,6 +2373,16 @@ write_migration_body(struct mstream* ms, const struct root* root, const char* da
     if (!reinit_db)
         mstream_cstr(ms, "    char buf[sizeof(\"PRAGMA user_version=+2147483648;\")];" NL NL);
 
+    /* Ensure requested version is within range */
+    if (!reinit_db)
+    {
+        mstream_fmt (ms, "    if (target_version < 0 || target_version > %d)" NL "    {" NL, max_version);
+        mstream_fmt (ms, "        %S(\"Invalid version requested for migration: %%d. Support versions 0-%d\", target_version);" NL,
+            LOG_ERR(root->log_err, data), max_version);
+        mstream_cstr(ms, "        return -1;" NL);
+        mstream_cstr(ms, "    }" NL NL);
+    }
+
     /* Get current db version */
     mstream_fmt (ms, "    version = %S_version(ctx);" NL, PREFIX(root->prefix, data));
     mstream_cstr(ms, "    if (version < 0)" NL);
@@ -2378,6 +2413,7 @@ write_migration_body(struct mstream* ms, const struct root* root, const char* da
         mstream_fmt (ms, "                goto migration_failed;" NL);
         mstream_fmt (ms, "            version = %d;" NL,
             root->downgrade ? root->downgrade->version + 1 : 0);
+        mstream_cstr(ms, "            /* fallthrough */" NL);
     }
 
     m = root->downgrade;
@@ -2486,6 +2522,16 @@ write_migration_body(struct mstream* ms, const struct root* root, const char* da
     mstream_fmt(ms, "            %S(\"Failed to upgrade db: Unknown version %%d\\n\", version);" NL, LOG_ERR(root->log_err, data));
     mstream_cstr(ms, "            goto migration_failed;" NL);
     mstream_cstr(ms, "    }" NL NL);
+
+    /* Ensure that we have reached the target version */
+    if (!reinit_db)
+    {
+        mstream_cstr(ms, "    if (version != target_version)" NL "    {" NL);
+        mstream_fmt (ms, "        %S(\"Failed to migrate db to version %%d. Migration stopped at version %%d\", target_version, version);" NL,
+            LOG_ERR(root->log_err, data));
+        mstream_cstr(ms, "        goto migration_failed;" NL);
+        mstream_cstr(ms, "    }" NL NL);
+    }
 
     /* Write new version to db */
     if (reinit_db)
@@ -2924,7 +2970,7 @@ gen_header(const struct root* root, const char* data, const char* file_name,
 
     /* Don't write header if it is identical to the existing one -- causes less
      * rebuilds */
-    if (mfile_map_read(&mf, file_name) == 0)
+    if (mfile_map_read(&mf, file_name, 1) == 0)
     {
         if (mf.size == ms.idx && memcmp(mf.address, ms.address, mf.size) == 0)
             return 0;
@@ -3368,7 +3414,7 @@ gen_source(const struct root* root, const char* data, const char* file_name,
 
     /* Don't write source if it is identical to the existing one -- causes less
      * rebuilds */
-    if (mfile_map_read(&mf, file_name) == 0)
+    if (mfile_map_read(&mf, file_name, 1) == 0)
     {
         if (mf.size == ms.idx && memcmp(mf.address, ms.address, mf.size) == 0)
             return 0;
@@ -3392,7 +3438,7 @@ int main(int argc, char** argv)
     if (parse_cmdline(argc, argv, &cfg) != 0)
         return -1;
 
-    if (mfile_map_read(&mf, cfg.input_file) < 0)
+    if (mfile_map_read(&mf, cfg.input_file, 0) < 0)
         return -1;
 
     root_init(&root);
