@@ -367,7 +367,6 @@ static inline void mstream_putc(struct mstream* ms, char c)
 
 static inline void mstream_write_int(struct mstream* ms, int value)
 {
-    char* dst;
     int digit = 1000000000;
     mstream_pad(ms, sizeof("-2147483648") - 1);
     if (value < 0)
@@ -375,21 +374,22 @@ static inline void mstream_write_int(struct mstream* ms, int value)
         ((char*)ms->address)[ms->idx++] = '-';
         value = -value;
     }
-    if (value == 0)
+    else if (value == 0)
     {
         ((char*)ms->address)[ms->idx++] = '0';
         return;
     }
+    while (value < digit)
+        digit /= 10;
     while (digit)
     {
         ((char*)ms->address)[ms->idx] = '0';
-        if (value >= digit)
-            ms->idx++;
         while (value >= digit)
         {
             value -= digit;
-            ((char*)ms->address)[ms->idx-1]++;
+            ((char*)ms->address)[ms->idx]++;
         }
+        ms->idx++;
         digit /= 10;
     }
 }
@@ -1733,7 +1733,10 @@ write_sqlite_prepare_stmt(struct mstream* ms, const struct root* root, const str
             a = q->in_args;
             while (a) {
                 if (a != q->in_args) mstream_cstr(ms, ", ");
-                mstream_fmt(ms, "%S=excluded.%S", a->name, data, a->name, data);
+                if (a->update)
+                    mstream_fmt(ms, "%S=?", a->name, data);
+                else
+                    mstream_fmt(ms, "%S=excluded.%S", a->name, data, a->name, data);
                 a = a->next;
             }
 
@@ -1919,8 +1922,19 @@ again:
         const char* cast = "";
         const char* null_cmp = "";
 
-        if (update_pass != a->update)
-            continue;
+        /* "update" args are at the end in the case of an upsert:
+         *   INSERT INTO ... (a, b, c) VALUES (?, ?, ?)
+         *   ON CONFLICT DO UPDATE SET a=excluded.a, b=?, c=? */
+        if (q->type == QUERY_UPSERT)
+            if (!a->update && !update_pass)
+                continue;
+        /* "update" args are at the beginning in the case of an update:
+         *   UPDATE ... SET b=?, c=?
+         *   WHERE a = ?
+         */
+        if (q->type != QUERY_UPSERT)
+            if (a->update != update_pass)
+                continue;
 
         if (first) mstream_cstr(ms, "    if ((ret = ");
         else mstream_cstr(ms, " ||" NL "        (ret = ");
@@ -1965,7 +1979,7 @@ again:
 
     mstream_cstr(ms, ")" NL "    {" NL);
     mstream_fmt(ms, "        %S(ret, sqlite3_errstr(ret), sqlite3_errmsg(ctx->db));" NL,
-                LOG_SQL_ERR(root->log_sql_err, data));
+        LOG_SQL_ERR(root->log_sql_err, data));
     mstream_cstr(ms, "        return -1;" NL "    }" NL NL);
 }
 
