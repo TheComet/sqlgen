@@ -455,7 +455,7 @@ struct cfg
     unsigned custom_deinit_decl : 1;
     unsigned custom_api         : 1;
     unsigned custom_api_decl    : 1;
-    unsigned no_forwards_compat : 1;
+    unsigned forwards_compat    : 1;
 };
 
 static int
@@ -1018,8 +1018,8 @@ parse(struct parser* p, struct root* root, struct cfg* cfg)
                     { cfg->custom_api = 1; cfg->custom_api_decl = 1; break; }
                 else if (str_eq_cstr("custom-api-decl", option, p->data))
                     { cfg->custom_api_decl = 1; break; }
-                else if (str_eq_cstr("no-forwards-compat", option, p->data))
-                    { cfg->no_forwards_compat = 1; break; }
+                else if (str_eq_cstr("forwards-compat", option, p->data))
+                    { cfg->forwards_compat = 1; break; }
 
                 if (scan_next_token(p) != '=')
                     return print_error(p, "Error: Expecting '='\n");
@@ -1218,7 +1218,7 @@ parse(struct parser* p, struct root* root, struct cfg* cfg)
                         else
                             return print_error(p, "Error: Unknown query type \"%.*s\"\n", t.len, p->data + t.off);
 
-                        if (query->type == QUERY_UPDATE || query->type == QUERY_UPSERT)
+                        if (query->type == QUERY_UPDATE)
                         {
                             do
                             {
@@ -1226,8 +1226,7 @@ parse(struct parser* p, struct root* root, struct cfg* cfg)
                                 struct str_view find;
                                 tok = scan_next_token(p);
                                 if (tok != TOK_LABEL)
-                                    return print_error(p, "Error: Expected column name after \"%s\"\n",
-                                            query->type == QUERY_UPDATE ? "update" : "upsert");
+                                    return print_error(p, "Error: Expected column name after \"update\"\n");
                                 find = p->value.str;
 
                                 a = query->in_args;
@@ -1733,20 +1732,12 @@ write_sqlite_prepare_stmt(struct mstream* ms, const struct root* root, const str
             a = q->in_args;
             while (a) {
                 if (a != q->in_args) mstream_cstr(ms, ", ");
-                if (a->update)
-                    mstream_fmt(ms, "%S=?", a->name, data);
-                else
-                    mstream_fmt(ms, "%S=excluded.%S", a->name, data, a->name, data);
+                mstream_fmt(ms, "%S=excluded.%S", a->name, data, a->name, data);
                 a = a->next;
             }
 
             if (q->return_name.len || q->cb_args)
             {
-                /*
-                 * Have to re-insert a value to trigger the RETURNING statement.
-                 * Caution here: We DON'T want to reinsert "id" or "rowid" because
-                 * it will cause the id to auto-increment.
-                 */
                 struct str_view reinsert = q->in_args ? q->in_args->name : q->return_name;
                 mstream_cstr(ms, " \"" NL);
                 mstream_fmt(ms, "            \"RETURNING ",
@@ -1791,13 +1782,11 @@ write_sqlite_prepare_stmt(struct mstream* ms, const struct root* root, const str
             {
                 /*
                  * Have to re-insert a value to trigger the RETURNING statement.
-                 * Caution here: We DON'T want to reinsert "id" or "rowid" because
-                 * it will cause the id to auto-increment.
+                 * In SQLite, a column named "rowid" is guaranteed to always exist,
+                 * and its datatype is trivial to copy.
                  */
-                struct str_view reinsert = q->in_args ? q->in_args->name : q->return_name;
                 mstream_cstr(ms, " \"" NL);
-                mstream_fmt(ms, "            \"ON CONFLICT DO UPDATE SET %S=excluded.%S RETURNING ",
-                    reinsert, data, reinsert, data);
+                mstream_cstr(ms, "            \"ON CONFLICT DO UPDATE SET rowid=rowid RETURNING ");
                 if (q->return_name.len)
                     mstream_fmt(ms, "%S", q->return_name, data);
                 a = q->cb_args;
@@ -1922,19 +1911,8 @@ again:
         const char* cast = "";
         const char* null_cmp = "";
 
-        /* "update" args are at the end in the case of an upsert:
-         *   INSERT INTO ... (a, b, c) VALUES (?, ?, ?)
-         *   ON CONFLICT DO UPDATE SET a=excluded.a, b=?, c=? */
-        if (q->type == QUERY_UPSERT)
-            if (!a->update && !update_pass)
-                continue;
-        /* "update" args are at the beginning in the case of an update:
-         *   UPDATE ... SET b=?, c=?
-         *   WHERE a = ?
-         */
-        if (q->type != QUERY_UPSERT)
-            if (a->update != update_pass)
-                continue;
+        if (a->update != update_pass)
+            continue;
 
         if (first) mstream_cstr(ms, "    if ((ret = ");
         else mstream_cstr(ms, " ||" NL "        (ret = ");
@@ -2369,7 +2347,7 @@ write_downgrade_forward_compat_func(struct mstream* ms, const struct root* root,
 }
 
 static void
-write_migration_body(struct mstream* ms, const struct root* root, const char* data, char reinit_db, char no_forwards_compat)
+write_migration_body(struct mstream* ms, const struct root* root, const char* data, char reinit_db, char forwards_compat)
 {
     int max_version = 0;
     struct migration* m;
@@ -2391,7 +2369,7 @@ write_migration_body(struct mstream* ms, const struct root* root, const char* da
     if (!reinit_db)
     {
         mstream_fmt (ms, "    if (target_version < 0 || target_version > %d)" NL "    {" NL, max_version);
-        mstream_fmt (ms, "        %S(\"Invalid version requested for migration: %%d. Support versions 0-%d\", target_version);" NL,
+        mstream_fmt (ms, "        %S(\"Invalid version requested for migration: %%d. Support versions 0-%d\\n\", target_version);" NL,
             LOG_ERR(root->log_err, data), max_version);
         mstream_cstr(ms, "        return -1;" NL);
         mstream_cstr(ms, "    }" NL NL);
@@ -2413,21 +2391,21 @@ write_migration_body(struct mstream* ms, const struct root* root, const char* da
     /* Downgrade code */
     mstream_cstr(ms, "    switch (version)" NL "    {" NL);
     mstream_cstr(ms, "        default:" NL);
-    if (no_forwards_compat)
+    if (forwards_compat)
+    {
+        mstream_fmt(ms, "            if (%S_downgrade_forward_compat(ctx->db) != 0)" NL,
+            PREFIX(root->prefix, data));
+        mstream_fmt(ms, "                goto migration_failed;" NL);
+        mstream_fmt(ms, "            version = %d;" NL,
+            root->downgrade ? root->downgrade->version + 1 : 0);
+        mstream_cstr(ms, "            /* fallthrough */" NL);
+    }
+    else
     {
         mstream_fmt(ms, "            %S(\"Database was created by a newer version of the software! "
             "Can't downgrade, because forwards compatibility was disabled in sqlgen.\");" NL,
             LOG_ERR(root->log_err, data));
         mstream_cstr(ms, "            goto migration_failed;" NL);
-    }
-    else
-    {
-        mstream_fmt (ms, "            if (%S_downgrade_forward_compat(ctx->db) != 0)" NL,
-            PREFIX(root->prefix, data));
-        mstream_fmt (ms, "                goto migration_failed;" NL);
-        mstream_fmt (ms, "            version = %d;" NL,
-            root->downgrade ? root->downgrade->version + 1 : 0);
-        mstream_cstr(ms, "            /* fallthrough */" NL);
     }
 
     m = root->downgrade;
@@ -2443,7 +2421,7 @@ write_migration_body(struct mstream* ms, const struct root* root, const char* da
             PREFIX(root->prefix, data), m->version);
         mstream_cstr(ms, "                goto migration_failed;" NL);
 
-        if (!no_forwards_compat && m->version == 0)
+        if (forwards_compat && m->version == 0)
         {
             mstream_fmt (ms, "            if (run_sqlite3_sql(ctx->db, \"DROP TABLE IF EXISTS %S_downgrades;\") != 0)" NL,
                 PREFIX(root->prefix, data));
@@ -2470,7 +2448,7 @@ write_migration_body(struct mstream* ms, const struct root* root, const char* da
         }
 
         /* The first migration also includes forward-compat code */
-        if (!no_forwards_compat && m->version == 1)
+        if (forwards_compat && m->version == 1)
         {
             struct migration* m2;
             mstream_cstr(ms, "            if (run_sqlite3_sql(ctx->db," NL);
@@ -2582,10 +2560,10 @@ write_migration_body(struct mstream* ms, const struct root* root, const char* da
 }
 
 static void
-write_migration_to_func(struct mstream* ms, const struct root* root, const char* data, char no_forwards_compat)
+write_migration_to_func(struct mstream* ms, const struct root* root, const char* data, char forwards_compat)
 {
     mstream_fmt(ms, "static int %S_migrate_to(struct %S* ctx, int target_version)" NL "{" NL, PREFIX(root->prefix, data), PREFIX(root->prefix, data));
-    write_migration_body(ms, root, data, 0, no_forwards_compat);
+    write_migration_body(ms, root, data, 0, forwards_compat);
     mstream_cstr(ms, "}" NL NL);
 }
 
@@ -2605,10 +2583,10 @@ write_upgrade_func(struct mstream* ms, const struct root* root, const char* data
 }
 
 static void
-write_reinit_func(struct mstream* ms, const struct root* root, const char* data, char no_forwards_compat)
+write_reinit_func(struct mstream* ms, const struct root* root, const char* data, char forwards_compat)
 {
     mstream_fmt(ms, "static int %S_reinit(struct %S* ctx)" NL "{" NL, PREFIX(root->prefix, data), PREFIX(root->prefix, data));
-    write_migration_body(ms, root, data, 1, no_forwards_compat);
+    write_migration_body(ms, root, data, 1, forwards_compat);
     mstream_cstr(ms, "}" NL NL);
 }
 
@@ -2850,6 +2828,11 @@ gen_header(const struct root* root, const char* data, const char* file_name,
     struct mfile mf;
     struct mstream ms = mstream_init_writeable();
 
+    mstream_cstr(&ms, "#pragma once" NL NL);
+    mstream_cstr(&ms, "#if defined(__cplusplus)" NL);
+    mstream_cstr(&ms, "extern \"C\" {" NL);
+    mstream_cstr(&ms, "#endif" NL NL);
+
     if (root->header_preamble.len)
         mstream_fmt(&ms, NL "%S" NL, root->header_preamble, data);
 
@@ -2976,11 +2959,15 @@ gen_header(const struct root* root, const char* data, const char* file_name,
     if (!custom_deinit)
         mstream_fmt(&ms, "void %S_deinit(void);" NL, PREFIX(root->prefix, data));
     if (!custom_api)
-        mstream_fmt(&ms, "struct %S_interface* %S(const char* backend);" NL,
+        mstream_fmt(&ms, "struct %S_interface* %S(const char* backend);" NL NL,
                 PREFIX(root->prefix, data), PREFIX(root->prefix, data));
 
     if (root->header_postamble.len)
         mstream_fmt(&ms, NL "%S" NL, root->header_postamble, data);
+
+    mstream_cstr(&ms, "#if defined(__cplusplus)" NL);
+    mstream_cstr(&ms, "}" NL);
+    mstream_cstr(&ms, "#endif" NL);
 
     /* Don't write header if it is identical to the existing one -- causes less
      * rebuilds */
@@ -3001,7 +2988,7 @@ gen_header(const struct root* root, const char* data, const char* file_name,
 
 static int
 gen_source(const struct root* root, const char* data, const char* file_name,
-    char debug_layer, char custom_init, char custom_deinit, char custom_api, char no_forwards_compat)
+    char debug_layer, char custom_init, char custom_deinit, char custom_api, char forwards_compat)
 {
     struct query* q;
     struct query_group* g;
@@ -3212,11 +3199,11 @@ gen_source(const struct root* root, const char* data, const char* file_name,
     write_migration_sql_stmts(&ms, root, root->downgrade, data, "downgrade");
     write_run_sql_stmts_func(&ms, root, data);
     write_version_func(&ms, root, data);
-    if (!no_forwards_compat)
+    if (forwards_compat)
         write_downgrade_forward_compat_func(&ms, root, data);
-    write_migration_to_func(&ms, root, data, no_forwards_compat);
+    write_migration_to_func(&ms, root, data, forwards_compat);
     write_upgrade_func(&ms, root, data);
-    write_reinit_func(&ms, root, data, no_forwards_compat);
+    write_reinit_func(&ms, root, data, forwards_compat);
 
     /* ------------------------------------------------------------------------
      * Interface
@@ -3467,7 +3454,7 @@ int main(int argc, char** argv)
             cfg.custom_init_decl, cfg.custom_deinit_decl, cfg.custom_api_decl) < 0)
         return -1;
     if (gen_source(&root, mf.address, cfg.output_source,
-            cfg.debug_layer, cfg.custom_init, cfg.custom_deinit, cfg.custom_api, cfg.no_forwards_compat) < 0)
+            cfg.debug_layer, cfg.custom_init, cfg.custom_deinit, cfg.custom_api, cfg.forwards_compat) < 0)
         return -1;
 
     return 0;

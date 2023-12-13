@@ -1,0 +1,45 @@
+%option prefix="migrations"
+
+%source-includes{
+#include "sqlgen/tests/migrations.h"
+#include "sqlite3.h"
+}
+
+%upgrade 1 {
+	CREATE TABLE people (
+		id INTEGER PRIMARY KEY,
+		name TEXT NOT NULL
+	);
+}
+%upgrade 2 {
+	ALTER TABLE people RENAME COLUMN name TO first_name;
+	ALTER TABLE people ADD last_name TEXT NOT NULL;
+}
+%downgrade 1 {
+	ALTER TABLE people DROP COLUMN last_name;
+	ALTER TABLE people RENAME COLUMN first_name TO name;
+}
+%downgrade 0 {
+	DROP TABLE people;
+}
+
+%query v1,person_add(const char* name) {
+	type insert
+	table people
+	return id
+}
+%query v2,person_add(const char* first_name, const char* last_name) {
+	type insert
+	table people
+	return id
+}
+%query v1,person_get(int id) {
+	type select-first
+	table people
+	callback const char* name
+}
+%query v2,person_get(int id) {
+	type select-first
+	table people
+	callback const char* first_name, const char* last_name
+}
