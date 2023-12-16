@@ -1,0 +1,27 @@
+%option prefix="delete_db"
+
+%source-includes{
+#include "sqlgen/tests/delete.h"
+#include "sqlite3.h"
+}
+
+%upgrade 1 {
+    CREATE TABLE people (
+        id INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        UNIQUE(name)
+    );
+    INSERT INTO people (name) VALUES ('name1'), ('name2');
+}
+%downgrade 0 {
+    DROP TABLE people;
+}
+
+%query invalid,delete_name(const char* name) {
+    type delete
+    stmt { SELECT lol this is invalid sql; }
+}
+%query valid,delete_name(const char* name) {
+    type delete
+    table people
+}

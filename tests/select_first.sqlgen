@@ -1,0 +1,63 @@
+%option prefix="select_first"
+
+%source-includes{
+#include "sqlgen/tests/select_first.h"
+#include "sqlite3.h"
+}
+
+%upgrade 1 {
+    CREATE TABLE people (
+        id INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        age INTEGER NOT NULL,
+        UNIQUE(name)
+    );
+    INSERT INTO people (name, age) VALUES ('name1', 69), ('name2', 42);
+}
+%downgrade 0 {
+    DROP TABLE people;
+}
+
+%query invalid,insert_or_ignore(const char* name, int age) {
+    type insert
+    stmt { SELECT lol this is invalid sql; }
+}
+%query valid,insert_or_ignore(const char* name, int age) {
+    type insert
+    table people
+}
+
+%query invalid,insert_or_get_id(const char* name, int age) {
+    type insert
+    stmt { SELECT lol this is invalid sql; }
+    return id
+}
+%query valid,insert_or_get_id(const char* name, int age) {
+    type insert
+    table people
+    return id
+}
+
+%query invalid,insert_or_get_cb(const char* name, int age) {
+    type insert
+    stmt { SELECT lol this is invalid sql; }
+    callback int id, const char* name, int age
+}
+%query valid,insert_or_get_cb(const char* name, int age) {
+    type insert
+    table people
+    callback int id, const char* name, int age
+}
+
+%query invalid,insert_or_get_id_and_cb(const char* name, int age) {
+    type insert
+    stmt { SELECT lol this is invalid sql; }
+    callback int id, const char* name, int age
+    return id
+}
+%query valid,insert_or_get_id_and_cb(const char* name, int age) {
+    type insert
+    table people
+    callback int id, const char* name, int age
+    return id
+}
