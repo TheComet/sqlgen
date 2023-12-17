@@ -2161,10 +2161,8 @@ write_sqlite_exec(struct mstream* ms, const struct root* root, const struct quer
          * If only "return" is specified, then we return the value returned by
          * the callback.
          */
-        case QUERY_UPDATE:
         case QUERY_INSERT:
         case QUERY_UPSERT:
-        case QUERY_DELETE:
         case QUERY_SELECT_FIRST:
             mstream_cstr(ms, "next_step:" NL);
             mstream_cstr(ms, "    ret = sqlite3_step(ctx->");
@@ -2233,6 +2231,8 @@ write_sqlite_exec(struct mstream* ms, const struct root* root, const struct quer
         /*
          * These query types return multiple values.
          */
+        case QUERY_UPDATE:
+        case QUERY_DELETE:
         case QUERY_SELECT_ALL:
             mstream_cstr(ms, "next_step:" NL);
             mstream_cstr(ms, "    ret = sqlite3_step(ctx->");
@@ -2253,10 +2253,7 @@ write_sqlite_exec(struct mstream* ms, const struct root* root, const struct quer
                 write_sqlite_exec_callback(ms, g, q, data);
 
             if (q->cb_args)
-            {
-                if (q->type == QUERY_SELECT_ALL)
-                    mstream_cstr(ms, "            if (ret == 0) goto next_step;" NL);
-            }
+                mstream_cstr(ms, "            if (ret == 0) goto next_step;" NL);
 
             if (q->cb_args)
             {
