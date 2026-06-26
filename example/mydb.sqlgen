@@ -38,7 +38,7 @@
 }
 
 %query example,add(const char* name null, uint32_t age null) {
-    type insert
+    type insert-or-get
     table test
 }
 %query example,get() {
@@ -48,16 +48,16 @@
 }
 
 %query person,add_or_get(const char* first_name, const char* last_name) {
-    type insert
+    type insert-or-get
     table people
     return id
 }
 %query person,associate_pet(int person_id, int pet_id) {
-    type insert
+    type insert-or-get
     table owned_pets
 }
 %query pet,add_or_get(const char* name, const char* fave_food) {
-    type insert
+    type insert-or-get
     table pets
     return id
 }

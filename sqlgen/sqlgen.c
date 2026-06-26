@@ -673,6 +673,11 @@ enum token
 {
     TOK_ERROR = -1,
     TOK_END = 0,
+    TOK_LBRACE = '{',
+    TOK_RBRACE = '}',
+    TOK_LPAREN = '(',
+    TOK_RPAREN = ')',
+    TOK_COMMA = ',',
     TOK_OPTION = 256,
     TOK_DOXYGEN,
     TOK_STRING,
@@ -906,15 +911,67 @@ struct arg
     struct arg* next;
     struct str_view type;
     struct str_view name;
-    char nullable;
-    char update;
+    const char* sql_type;
+    const char* cast_to_sql;
+    const char* cast_from_sql;
+    const char* compare_op;
+    const char* null_value;
+    const char* printf_fmt;
+    unsigned nullable : 1;
+    unsigned update : 1;
+    /* Used for blob types where the "length" is implicit */
+    unsigned has_hidden_len_param : 1;
 };
 
 static struct arg*
-arg_alloc(void)
+arg_alloc(struct str_view type, struct str_view name, const char* data)
 {
-    struct arg* a = malloc(sizeof *a);
-    memset(a, 0, sizeof *a);
+    struct arg* a;
+    int i;
+    static const struct {
+        const char* c_type;
+        const char* sql_type;
+        const char* cast_to_sql;
+        const char* cast_from_sql;
+        const char* compare_op;
+        const char* null_value;
+        const char* printf_fmt;
+        unsigned has_hidden_len_param : 1;
+    } type_map[] = {
+        {"uint64_t",        "int64", "(int64_t)", "(uint64_t)", "==", "(uint64_t)-1", "%\" PRIu64 \"", 0},
+        {"int64_t",         "int64", "",          "",           "<",  "0",            "%\" PRIi64 \"", 0},
+        {"int",             "int",   "",          "",           "<",  "0",            "%d",            0},
+        {"uint32_t",        "int",   "(int)",     "(uint32_t)", "==", "(uint32_t)-1", "%u",            0},
+        {"uint16_t",        "int",   "(int)",     "(uint16_t)", "==", "(uint16_t)-1", "%d",            0},
+        {"uint8_t",         "int",   "(int)",     "(uint8_t)",  "==", "(uint8_t)-1",  "%d",            0},
+        {"unsigned char",   "int",   "(int)",     "(unsigned char)", "==", "(unsigned char)-1", "%d",  0},
+        {"int32_t",         "int",   "",          "",           "<",  "0",            "%d",            0},
+        {"int16_t",         "int",   "",          "",           "<",  "0",            "%d",            0},
+        {"int8_t",          "int",   "",          "",           "<",  "0",            "%d",            0},
+        {"char",            "int",   "",          "",           "<",  "0",            "%d",            0},
+        {"const char*",     "text",  "",          "(const char*)", "==", "NULL",      "\\\"%s\\\"",    0},
+        {"struct str_view", "text",  "",          "(const char*)", "==", "NULL",      "\\\"%.*s\\\"",  0},
+        {"struct strview",  "text",  "",          "(const char*)", "==", "NULL",      "\\\"%.*s\\\"",  0},
+        {"const void*",     "blob",  "",          "(const void*)", "==", "NULL",      "%p",            1},
+    };
+    for(i = 0; i != sizeof(type_map) / sizeof(*type_map); ++i)
+        if (cstr_eq_str(type_map[i].c_type, type, data))
+            break;
+    if (i == sizeof(type_map) / sizeof(*type_map))
+        return NULL;
+    a = malloc(sizeof *a);
+    a->next = NULL;
+    a->type = type;
+    a->name = name;
+    a->sql_type = type_map[i].sql_type;
+    a->cast_from_sql = type_map[i].cast_from_sql;
+    a->cast_to_sql = type_map[i].cast_to_sql;
+    a->compare_op = type_map[i].compare_op;
+    a->null_value = type_map[i].null_value;
+    a->printf_fmt = type_map[i].printf_fmt;
+    a->nullable = 0;
+    a->update = 0;
+    a->has_hidden_len_param = type_map[i].has_hidden_len_param;
     return a;
 }
 
@@ -954,7 +1011,8 @@ migration_alloc(int version)
 enum query_type
 {
     QUERY_NONE,
-    QUERY_INSERT,
+    QUERY_INSERT_NEW,
+    QUERY_INSERT_OR_GET,
     QUERY_UPDATE,
     QUERY_UPSERT,
     QUERY_DELETE,
@@ -1218,9 +1276,34 @@ parse(struct parser* p, struct root* root, struct cfg* cfg)
                             return print_error(p, "Error: Expected parameter after \",\"\n");
                         /* fallthrough */
                     case TOK_LABEL: {
-                        struct arg* arg = arg_alloc();
-                        arg->type = p->value.str;
+                        struct str_view arg_type, arg_name;
+                        struct arg* arg;
 
+                        arg_type = p->value.str;
+
+                        /* Special case, struct -> expect another label */
+                        if (cstr_eq_str("struct", arg_type, p->data))
+                        {
+                            if (scan_next_token(p) != TOK_LABEL)
+                                return print_error(p, "Error: Missing struct name after \"struct\"\n");
+                            arg_type.len = p->value.str.off + p->value.str.len - arg_type.off;
+                        }
+                        /* Special case, const -> expect another label */
+                        if (cstr_eq_str("const", arg_type, p->data))
+                        {
+                            if (scan_next_token(p) != TOK_LABEL)
+                                return print_error(p, "Error: const qualifier without type\n");
+                            arg_type.len = p->value.str.off + p->value.str.len - arg_type.off;
+                        }
+
+                        if (scan_next_token(p) != TOK_LABEL)
+                            return print_error(p, "Error: Missing parameter name\n");
+                        arg_name = p->value.str;
+
+                        /* Insert into query */
+                        arg = arg_alloc(arg_type, arg_name, p->data);
+                        if (arg == NULL)
+                            return print_error(p, "Unsupported C type\n");
                         if (query->in_args == NULL)
                             query->in_args = arg;
                         else
@@ -1230,25 +1313,6 @@ parse(struct parser* p, struct root* root, struct cfg* cfg)
                                 args = args->next;
                             args->next = arg;
                         }
-
-                        /* Special case, struct -> expect another label */
-                        if (cstr_eq_str("struct", arg->type, p->data))
-                        {
-                            if (scan_next_token(p) != TOK_LABEL)
-                                return print_error(p, "Error: Missing struct name after \"struct\"\n");
-                            arg->type.len = p->value.str.off + p->value.str.len - arg->type.off;
-                        }
-                        /* Special case, const -> expect another label */
-                        if (cstr_eq_str("const", arg->type, p->data))
-                        {
-                            if (scan_next_token(p) != TOK_LABEL)
-                                return print_error(p, "Error: const qualifier without type\n");
-                            arg->type.len = p->value.str.off + p->value.str.len - arg->type.off;
-                        }
-
-                        if (scan_next_token(p) != TOK_LABEL)
-                            return print_error(p, "Error: Missing parameter name\n");
-                        arg->name = p->value.str;
 
                         /* Param can have a "null" qualifier on the end */
                         if ((tok = scan_next_token(p)) == TOK_LABEL)
@@ -1281,8 +1345,10 @@ parse(struct parser* p, struct root* root, struct cfg* cfg)
                         if (scan_next_token(p) != TOK_LABEL)
                             return print_error(p, "Error: Expected query type after \"type\"\n");
                         t = p->value.str;
-                        if (cstr_eq_str("insert", t, p->data))
-                            query->type = QUERY_INSERT;
+                        if (cstr_eq_str("insert-new", t, p->data))
+                            query->type = QUERY_INSERT_NEW;
+                        else if (cstr_eq_str("insert-or-get", t, p->data))
+                            query->type = QUERY_INSERT_OR_GET;
                         else if (cstr_eq_str("update", t, p->data))
                             query->type = QUERY_UPDATE;
                         else if (cstr_eq_str("upsert", t, p->data))
@@ -1356,32 +1422,34 @@ parse(struct parser* p, struct root* root, struct cfg* cfg)
                                     return print_error(p, "Error: Expected parameter after \",\"\n");
                                 /* fallthrough */
                             case TOK_LABEL: {
+                                char arg_nullable;
                                 struct arg* a;
-                                struct arg* arg = arg_alloc();
-                                arg->type = p->value.str;
-
-                                if (query->bind_args == NULL)
-                                    query->bind_args = arg;
-                                else
-                                {
-                                    struct arg* args = query->bind_args;
-                                    while (args->next)
-                                        args = args->next;
-                                    args->next = arg;
-                                }
+                                struct arg* arg;
 
                                 /* Get the type information and other data from the function's parameter list */
                                 for (a = query->in_args; a; a = a->next)
                                     if (str_eq_str(a->name, p->value.str, p->data))
                                     {
-                                        arg->name = a->name;
-                                        arg->type = a->type;
+                                        arg = arg_alloc(a->type, a->name, p->data);
+                                        if (arg == NULL)
+                                            return print_error(p, "Unsupported C type\n");
                                         arg->nullable = a->nullable;
+                                        if (query->bind_args == NULL)
+                                            query->bind_args = arg;
+                                        else
+                                        {
+                                            struct arg* args = query->bind_args;
+                                            while (args->next)
+                                                args = args->next;
+                                            args->next = arg;
+                                        }
+
                                         goto expect_next_bind_param;
                                     }
 
                                 return print_error(p, "Bind argument \"%.*s\" does not exist in function's parameter list\n",
                                         p->value.str.len, p->data + p->value.str.off);
+
                             } break;
 
                             default: goto switch_next_stmt;
@@ -1406,9 +1474,33 @@ parse(struct parser* p, struct root* root, struct cfg* cfg)
                                     return print_error(p, "Error: Expected parameter after \",\"\n");
                                 /* fallthrough */
                             case TOK_LABEL: {
-                                struct arg* arg = arg_alloc();
-                                arg->type = p->value.str;
+                                struct str_view arg_type, arg_name;
+                                struct arg* arg;
 
+                                arg_type = p->value.str;
+
+                                /* Special case, struct -> expect another label */
+                                if (cstr_eq_str("struct", arg_type, p->data))
+                                {
+                                    if (scan_next_token(p) != TOK_LABEL)
+                                        return print_error(p, "Error: Missing struct name after \"struct\"\n");
+                                    arg_type.len = p->value.str.off + p->value.str.len - arg_type.off;
+                                }
+                                /* Special case, const -> expect another label */
+                                if (cstr_eq_str("const", arg_type, p->data))
+                                {
+                                    if (scan_next_token(p) != TOK_LABEL)
+                                        return print_error(p, "Error: const qualifier without type\n");
+                                    arg_type.len = p->value.str.off + p->value.str.len - arg_type.off;
+                                }
+
+                                if (scan_next_token(p) != TOK_LABEL)
+                                    return print_error(p, "Error: Missing parameter name\n");
+                                arg_name = p->value.str;
+
+                                arg = arg_alloc(arg_type, arg_name, p->data);
+                                if (arg == NULL)
+                                    return print_error(p, "Unsupported C type\n");
                                 if (query->cb_args == NULL)
                                     query->cb_args = arg;
                                 else
@@ -1418,25 +1510,6 @@ parse(struct parser* p, struct root* root, struct cfg* cfg)
                                         args = args->next;
                                     args->next = arg;
                                 }
-
-                                /* Special case, struct -> expect another label */
-                                if (cstr_eq_str("struct", arg->type, p->data))
-                                {
-                                    if (scan_next_token(p) != TOK_LABEL)
-                                        return print_error(p, "Error: Missing struct name after \"struct\"\n");
-                                    arg->type.len = p->value.str.off + p->value.str.len - arg->type.off;
-                                }
-                                /* Special case, const -> expect another label */
-                                if (cstr_eq_str("const", arg->type, p->data))
-                                {
-                                    if (scan_next_token(p) != TOK_LABEL)
-                                        return print_error(p, "Error: const qualifier without type\n");
-                                    arg->type.len = p->value.str.off + p->value.str.len - arg->type.off;
-                                }
-
-                                if (scan_next_token(p) != TOK_LABEL)
-                                    return print_error(p, "Error: Missing parameter name\n");
-                                arg->name = p->value.str;
 
                                 /* Param can have a "null" qualifier on the end */
                                 if ((tok = scan_next_token(p)) == TOK_LABEL)
@@ -1539,9 +1612,31 @@ parse(struct parser* p, struct root* root, struct cfg* cfg)
                             return print_error(p, "Error: Expected parameter after \",\"\n");
                         /* fallthrough */
                     case TOK_LABEL: {
-                        struct arg* arg = arg = arg_alloc();
-                        arg->type = p->value.str;
+                        struct str_view arg_type, arg_name;
+                        struct arg* arg;
 
+                        /* Special case, struct -> expect another label */
+                        if (cstr_eq_str("struct", arg_type, p->data))
+                        {
+                            if (scan_next_token(p) != TOK_LABEL)
+                                return print_error(p, "Error: Missing struct name after \"struct\"\n");
+                            arg_type.len = p->value.str.off + p->value.str.len - arg_type.off;
+                        }
+                        /* Special case, const -> expect another label */
+                        if (cstr_eq_str("const", arg_type, p->data))
+                        {
+                            if (scan_next_token(p) != TOK_LABEL)
+                                return print_error(p, "Error: const qualifier without type\n");
+                            arg_type.len = p->value.str.off + p->value.str.len - arg_type.off;
+                        }
+
+                        if (scan_next_token(p) != TOK_LABEL)
+                            return print_error(p, "Error: struct without name\n");
+                        arg_name = p->value.str;
+
+                        arg = arg_alloc(arg_type, arg_name, p->data);
+                        if (arg == NULL)
+                            return print_error(p, "Unsupported C type\n");
                         if (func->args == NULL)
                             func->args = arg;
                         else
@@ -1551,25 +1646,6 @@ parse(struct parser* p, struct root* root, struct cfg* cfg)
                                 args = args->next;
                             args->next = arg;
                         }
-
-                        /* Special case, struct -> expect another label */
-                        if (cstr_eq_str("struct", arg->type, p->data))
-                        {
-                            if (scan_next_token(p) != TOK_LABEL)
-                                return print_error(p, "Error: Missing struct name after \"struct\"\n");
-                            arg->type.len = p->value.str.off + p->value.str.len - arg->type.off;
-                        }
-                        /* Special case, const -> expect another label */
-                        if (cstr_eq_str("const", arg->type, p->data))
-                        {
-                            if (scan_next_token(p) != TOK_LABEL)
-                                return print_error(p, "Error: const qualifier without type\n");
-                            arg->type.len = p->value.str.off + p->value.str.len - arg->type.off;
-                        }
-
-                        if (scan_next_token(p) != TOK_LABEL)
-                            return print_error(p, "Error: struct without name\n");
-                        arg->name = p->value.str;
 
                         goto expect_next_func_param;
                     } break;
@@ -1725,7 +1801,11 @@ write_func_param_list(struct mstream* ms, const struct root* root, const struct 
     mstream_fmt(ms, "struct %S* ctx", PREFIX(root->prefix, data));
 
     for (a = q->in_args; a; a = a->next)
+    {
         mstream_fmt(ms, ", %S %S", a->type, data, a->name, data);
+        if (a->has_hidden_len_param)
+            mstream_fmt(ms, ", int %S_len", a->name, data);
+    }
 
     if (q->cb_args)
         mstream_cstr(ms, ", int (*on_row)(");
@@ -1735,6 +1815,8 @@ write_func_param_list(struct mstream* ms, const struct root* root, const struct 
         if (a != q->cb_args)
             mstream_cstr(ms, ", ");
         mstream_fmt(ms, "%S %S", a->type, data, a->name, data);
+        if (a->has_hidden_len_param)
+            mstream_fmt(ms, ", int %S_len", a->name, data);
     }
 
     if (q->cb_args)
@@ -1811,6 +1893,7 @@ write_sqlite_prepare_stmt(struct mstream* ms, const struct root* root, const str
     }
     else switch (q->type)
     {
+        case QUERY_NONE: break;
         case QUERY_UPSERT:
             mstream_fmt(ms, "            \"INSERT INTO %S (", q->table_name, data);
 
@@ -1839,7 +1922,7 @@ write_sqlite_prepare_stmt(struct mstream* ms, const struct root* root, const str
             if (q->return_name.len || q->cb_args)
             {
                 mstream_cstr(ms, " \"" NL);
-                mstream_cstr(ms, "            \"RETURNING ");
+                mstream_cstr(ms, "            \" RETURNING ");
                 if (q->return_name.len)
                     mstream_fmt(ms, "%S", q->return_name, data);
                 for (a = q->cb_args; a; a = a->next)
@@ -1853,7 +1936,37 @@ write_sqlite_prepare_stmt(struct mstream* ms, const struct root* root, const str
 
             break;
 
-        case QUERY_INSERT:
+        case QUERY_INSERT_NEW:
+            mstream_fmt(ms, "            \"INSERT INTO %S (", q->table_name, data);
+
+            for (a = q->in_args; a; a = a->next)
+            {
+                if (a != q->in_args) mstream_cstr(ms, ", ");
+                mstream_fmt(ms, "%S", a->name, data);
+            }
+            mstream_cstr(ms, ") VALUES (");
+            for (a = q->in_args; a; a = a->next)
+            {
+                if (a != q->in_args)
+                    mstream_cstr(ms, ", ");
+                mstream_cstr(ms, "?");
+            }
+            mstream_cstr(ms, ")\"" NL);
+
+            mstream_cstr(ms, "            \" RETURNING ");
+            if (q->return_name.len)
+                mstream_fmt(ms, "%S", q->return_name, data);
+            for (a = q->cb_args; a; a = a->next)
+            {
+                if (a != q->cb_args || q->return_name.len)
+                    mstream_cstr(ms, ", ");
+                mstream_fmt(ms, "%S", a->name, data);
+            }
+            mstream_cstr(ms, ";\"," NL);
+
+            break;
+
+        case QUERY_INSERT_OR_GET:
             if (q->return_name.len || q->cb_args)
                 mstream_fmt(ms, "            \"INSERT INTO %S (", q->table_name, data);
             else
@@ -2010,10 +2123,6 @@ again:
     a = q->bind_args;
     for (; a; a = a->next)
     {
-        const char* sqlite_type = "";
-        const char* cast = "";
-        const char* null_cmp = "";
-
         if (a->update != update_pass)
             continue;
 
@@ -2021,35 +2130,24 @@ again:
         else mstream_cstr(ms, " ||" NL "        (ret = ");
         first = 0;
 
-        if (cstr_eq_str("uint64_t", a->type, data))
-            { sqlite_type = "int64"; cast = "(int64_t)"; null_cmp = "(uint64_t)-1"; }
-        else if (cstr_eq_str("int64_t", a->type, data))
-            { sqlite_type = "int64"; null_cmp = "< 0"; }
-        else if (cstr_eq_str("int", a->type, data))
-            { sqlite_type = "int"; null_cmp = "< 0"; }
-        else if (cstr_eq_str("uint32_t", a->type, data))
-            { sqlite_type = "int"; cast = "(int)"; null_cmp = "== (uint32_t)-1"; }
-        else if (cstr_eq_str("uint16_t", a->type, data))
-            { sqlite_type = "int"; cast = "(int)"; null_cmp = "== (uint16_t)-1"; }
-        else if (cstr_eq_str("struct str_view", a->type, data))
-            { sqlite_type = "text"; null_cmp = "== NULL"; }
-        else if (cstr_eq_str("const char*", a->type, data))
-            { sqlite_type = "text"; null_cmp = "== NULL"; }
-
         if (a->nullable)
         {
-            mstream_fmt(ms, "%S %s ? sqlite3_bind_null(ctx->", a->name, data, null_cmp);
+            mstream_fmt(ms, "%S %s %s ? sqlite3_bind_null(ctx->", a->name, data, a->compare_op, a->null_value);
             write_func_name(ms, g, q, data);
             mstream_fmt(ms, ", %d) : ", i);
         }
-        mstream_fmt(ms, "sqlite3_bind_%s(ctx->", sqlite_type);
+        mstream_fmt(ms, "sqlite3_bind_%s(ctx->", a->sql_type);
         write_func_name(ms, g, q, data);
-        mstream_fmt(ms, ", %d, %s%S", i, cast, a->name, data);
+        mstream_fmt(ms, ", %d, %s%S", i, a->cast_to_sql, a->name, data);
 
         if (cstr_eq_str("struct str_view", a->type, data))
             mstream_fmt(ms, ".data, %S.len, SQLITE_STATIC", a->name, data);
+        else if (cstr_eq_str("struct strview", a->type, data))
+            mstream_fmt(ms, ".data, %S.len, SQLITE_STATIC", a->name, data);
         else if (cstr_eq_str("const char*", a->type, data))
             mstream_cstr(ms, ", -1, SQLITE_STATIC");
+        else if (cstr_eq_str("const void*", a->type, data))
+            mstream_fmt(ms, ", %S_len, SQLITE_STATIC", a->name, data);
         mstream_cstr(ms, ")) != SQLITE_OK");
 
         i++;
@@ -2073,38 +2171,25 @@ write_sqlite_exec_callback(struct mstream* ms, const struct query_group* g, cons
     mstream_cstr(ms, "            ret = on_row(" NL);
     for (; a; a = a->next, i++)
     {
-        const char* sqlite_type = "";
-        const char* cast = "";
-        const char* null_value = "";
-
-        if (cstr_eq_str("uint64_t", a->type, data))
-            { sqlite_type = "int64"; cast = "(uint64_t)"; null_value = "(uint64_t)-1"; }
-        else if (cstr_eq_str("int64_t", a->type, data))
-            { sqlite_type = "int64"; null_value = "-1"; }
-        else if (cstr_eq_str("int", a->type, data))
-            { sqlite_type = "int"; null_value = "-1"; }
-        else if (cstr_eq_str("uint32_t", a->type, data))
-            { sqlite_type = "int"; cast = "(uint32_t)"; null_value = "(uint32_t)-1"; }
-        else if (cstr_eq_str("uint16_t", a->type, data))
-            { sqlite_type = "int"; cast = "(uint16_t)"; null_value = "(uint16_t)-1"; }
-        else if (cstr_eq_str("struct str_view", a->type, data))
-            { sqlite_type = "text"; cast = "(const char*)"; null_value = "NULL"; }
-        else if (cstr_eq_str("const char*", a->type, data))
-            { sqlite_type = "text"; cast = "(const char*)"; null_value = "NULL"; }
-
         mstream_cstr(ms, "                ");
         if (a->nullable)
         {
             mstream_cstr(ms, "sqlite3_column_type(ctx->");
             write_func_name(ms, g, q, data);
             mstream_fmt(ms, ", %d) == SQLITE_NULL ? ", i);
-            mstream_cstr(ms, null_value);
+            mstream_cstr(ms, a->null_value);
             mstream_cstr(ms, " : ");
         }
 
-        mstream_fmt(ms, "%ssqlite3_column_%s(ctx->", cast, sqlite_type);
+        mstream_fmt(ms, "%ssqlite3_column_%s(ctx->", a->cast_from_sql, a->sql_type);
         write_func_name(ms, g, q, data);
         mstream_fmt(ms, ", %d)," NL, i);
+        if (a->has_hidden_len_param)
+        {
+            mstream_cstr(ms, "                sqlite3_column_bytes(ctx->");
+            write_func_name(ms, g, q, data);
+            mstream_fmt(ms, ", %d)," NL, i);
+        }
     }
     mstream_cstr(ms, "                user_data);" NL);
 }
@@ -2114,6 +2199,7 @@ write_sqlite_exec(struct mstream* ms, const struct root* root, const struct quer
 {
     switch (q->type)
     {
+        case QUERY_NONE: break;
         /*
          * Exists should return:
          *   1 if a row was found.
@@ -2161,7 +2247,8 @@ write_sqlite_exec(struct mstream* ms, const struct root* root, const struct quer
          * If only "return" is specified, then we return the value returned by
          * the callback.
          */
-        case QUERY_INSERT:
+        case QUERY_INSERT_NEW:
+        case QUERY_INSERT_OR_GET:
         case QUERY_UPSERT:
         case QUERY_SELECT_FIRST:
             mstream_cstr(ms, "next_step:" NL);
@@ -2215,8 +2302,13 @@ write_sqlite_exec(struct mstream* ms, const struct root* root, const struct quer
             }
 
             mstream_cstr(ms, "    }" NL NL);
-            mstream_fmt(ms, "    %S(ret, sqlite3_errstr(ret), sqlite3_errmsg(ctx->db));" NL,
-                        LOG_SQL_ERR(root->log_sql_err, data));
+
+            /* We want to print an error in all cases except for "insert-new",
+             * because there, an error case is expected behavior */
+            if (q->type != QUERY_INSERT_NEW)
+                mstream_fmt(ms,
+                    "    %S(ret, sqlite3_errstr(ret), sqlite3_errmsg(ctx->db));" NL,
+                    LOG_SQL_ERR(root->log_sql_err, data));
             if (q->return_name.len || q->cb_args)
                 mstream_cstr(ms, "done:" NL);
             mstream_cstr(ms, "    sqlite3_reset(ctx->");
@@ -2693,6 +2785,8 @@ write_debug_wrapper(struct mstream* ms, const struct root* root, const struct qu
         {
             if (a != q->cb_args) mstream_cstr(ms, ", ");
             mstream_fmt(ms, "%S %S", a->type, data, a->name, data);
+            if (a->has_hidden_len_param)
+                mstream_fmt(ms, ", int %S_len", a->name, data);
         }
         mstream_cstr(ms, ", void* user_data)" NL "{" NL);
 
@@ -2702,19 +2796,17 @@ write_debug_wrapper(struct mstream* ms, const struct root* root, const struct qu
         for (a = q->cb_args; a; a = a->next)
         {
             if (a != q->cb_args) mstream_cstr(ms, " | ");
-            if (cstr_eq_str("const char*", a->type, data))
-                mstream_cstr(ms, "\\\"%s\\\"");
-            else
-                mstream_cstr(ms, "%d");
+            mstream_cstr(ms, a->printf_fmt);
+            if (a->has_hidden_len_param)
+                mstream_cstr(ms, " (len=%d)");
         }
         mstream_cstr(ms, "\\n\", ");
         for (a = q->cb_args; a; a = a->next)
         {
             if (a != q->cb_args) mstream_cstr(ms, ", ");
-            if (cstr_eq_str("const char*", a->type, data)) {}
-            else
-                mstream_cstr(ms, "(int)");
-            mstream_str(ms, a->name, data);
+            mstream_fmt(ms, "%s%S", a->cast_from_sql, a->name, data);
+            if (a->has_hidden_len_param)
+                mstream_fmt(ms, ", %S_len", a->name, data);
         }
         mstream_cstr(ms, ");" NL);
 
@@ -2723,12 +2815,16 @@ write_debug_wrapper(struct mstream* ms, const struct root* root, const struct qu
         {
             if (a != q->cb_args) mstream_cstr(ms, ", ");
             mstream_str(ms, a->type, data);
+            if (a->has_hidden_len_param)
+                mstream_cstr(ms, ", int");
         }
         mstream_cstr(ms, ",void*))dbg[0])(");
         for (a = q->cb_args; a; a = a->next)
         {
             if (a != q->cb_args) mstream_cstr(ms, ", ");
             mstream_str(ms, a->name, data);
+            if (a->has_hidden_len_param)
+                mstream_fmt(ms, ", %S_len", a->name, data);
         }
         mstream_cstr(ms, ", dbg[1]);" NL);
         mstream_cstr(ms, "}" NL);
@@ -2751,17 +2847,7 @@ write_debug_wrapper(struct mstream* ms, const struct root* root, const struct qu
     {
         if (a != q->in_args)
             mstream_cstr(ms, ", ");
-
-        if (cstr_eq_str("const char*", a->type, data))
-            mstream_cstr(ms, "\\\"%s\\\"");
-        else if (cstr_eq_str("struct str_view", a->type, data))
-            mstream_cstr(ms, "\\\"%.*s\\\"");
-        else if (cstr_eq_str("int64_t", a->type, data))
-            mstream_cstr(ms, "%\" PRIi64\"");
-        else if (cstr_eq_str("uint64_t", a->type, data))
-            mstream_cstr(ms, "%\" PRIu64\"");
-        else
-            mstream_cstr(ms, "%d");
+        mstream_cstr(ms, a->printf_fmt);
     }
     mstream_cstr(ms, ")\\n\"");
     if (q->in_args)
@@ -2771,16 +2857,11 @@ write_debug_wrapper(struct mstream* ms, const struct root* root, const struct qu
         if (a != q->in_args)
             mstream_cstr(ms, ", ");
 
-        if (cstr_eq_str("const char*", a->type, data))
-            mstream_str(ms, a->name, data);
-        else if (cstr_eq_str("struct str_view", a->type, data))
-            mstream_fmt(ms, "%S.len, %S.data", a->name, data, a->name, data);
-        else if (cstr_eq_str("int64_t", a->type, data))
-            mstream_str(ms, a->name, data);
-        else if (cstr_eq_str("uint64_t", a->type, data))
-            mstream_str(ms, a->name, data);
-        else
-            mstream_fmt(ms, "(int)%S", a->name, data);
+        if (cstr_eq_str("struct str_view", a->type, data) ||
+            cstr_eq_str("struct strview", a->type, data))
+                mstream_fmt(ms, "%S.len, %S.data", a->name, data, a->name, data);
+        else 
+            mstream_fmt(ms, "%S", a->name, data);
     }
     mstream_cstr(ms, ");" NL);
 
@@ -2800,7 +2881,11 @@ write_debug_wrapper(struct mstream* ms, const struct root* root, const struct qu
     mstream_str(ms, q->name, data);
     mstream_cstr(ms, "(ctx");
     for (a = q->in_args; a; a = a->next)
+    {
         mstream_fmt(ms, ", %S", a->name, data);
+        if (a->has_hidden_len_param)
+            mstream_fmt(ms, ", %S_len", a->name, data);
+    }
     if (q->cb_args)
     {
         mstream_cstr(ms, ", dbg_");
@@ -2914,8 +2999,8 @@ gen_header(const struct root* root, const char* data, const char* file_name,
     write_block_reindented_cstr(&ms, 4, "/*!" NL
         " * \\brief Open a database connection. Must be closed again after use." NL
         " * \\param[in] uri A file path to a database file." NL
-        " * \\return If successful, the database connection is returned, which can be used" NL
-        " * for all future queries." NL
+        " * \\return If successful, the database connection is returned, which can be" NL
+        " * used for all future queries." NL
         " */");
     mstream_fmt(&ms, "    struct %S* (*open)(const char* uri);" NL,
         PREFIX(root->prefix, data));
@@ -2948,7 +3033,8 @@ gen_header(const struct root* root, const char* data, const char* file_name,
         PREFIX(root->prefix, data));
     write_block_reindented_cstr(&ms, 4, "/*!" NL
         " * \\brief Migrates the database to a specific version." NL
-        " * The version can older or newer than the current state of the database." NL
+        " * The version can be older or newer than the current state of the database." NL
+        " * \\return 0 on success, negative on error." NL
         " */");
     mstream_fmt(&ms, "    int (*migrate_to)(struct %S* ctx, int target_version);" NL,
         PREFIX(root->prefix, data));
@@ -3024,15 +3110,6 @@ gen_header(const struct root* root, const char* data, const char* file_name,
     mstream_cstr(&ms, "#if defined(__cplusplus)" NL);
     mstream_cstr(&ms, "}" NL);
     mstream_cstr(&ms, "#endif" NL);
-
-    /* Don't write header if it is identical to the existing one -- causes less
-     * rebuilds */
-    if (mfile_map_read(&mf, file_name, 1) == 0)
-    {
-        if (mf.size == ms.write_ptr && memcmp(mf.address, ms.address, mf.size) == 0)
-            return 0;
-        mfile_unmap(&mf);
-    }
 
     if (mfile_map_write(&mf, file_name, ms.write_ptr) != 0)
         return -1;
@@ -3265,7 +3342,7 @@ gen_source(const struct root* root, const char* data, const char* file_name,
         mstream_fmt (&ms, "    struct %S* ctx;" NL, PREFIX(root->prefix, data));
         mstream_fmt (&ms, "    %S(\"Opening database \\\"%%s\\\"\\n\", uri);" NL, LOG_DBG(root->log_dbg, data));
         mstream_cstr(&ms, "    ctx = db_sqlite3.open(uri);" NL);
-        mstream_fmt (&ms, "    %S(\"retval=%%p\\n\", ctx);" NL, LOG_DBG(root->log_dbg, data));
+        mstream_fmt (&ms, "    %S(\"retval=%%p\\n\", (void*)ctx);" NL, LOG_DBG(root->log_dbg, data));
         mstream_cstr(&ms, "    return ctx;" NL);
         mstream_cstr(&ms, "}" NL NL);
 
@@ -3372,15 +3449,6 @@ gen_source(const struct root* root, const char* data, const char* file_name,
 
     if (root->source_postamble.len)
         mstream_fmt(&ms, NL "%S" NL, root->source_postamble, data);
-
-    /* Don't write source if it is identical to the existing one -- causes less
-     * rebuilds */
-    if (mfile_map_read(&mf, file_name, 1) == 0)
-    {
-        if (mf.size == ms.write_ptr && memcmp(mf.address, ms.address, mf.size) == 0)
-            return 0;
-        mfile_unmap(&mf);
-    }
 
     if (mfile_map_write(&mf, file_name, ms.write_ptr) != 0)
         return -1;

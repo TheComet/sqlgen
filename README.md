@@ -386,16 +386,27 @@ defines how the generated C function behaves.
 These are:
 ```c
 %query example() {
-    type insert | upsert | update | delete | exists | select-single | select-all
+    type insert-new | insert-or-get | upsert | update | delete | exists | select-first | select-all
 }
 ```
-```insert``` will generate either a "insert or get" operation (if you also specify a "return"
-or "callback" statement, or a "insert or ignore" operation. The C function
-will return 0 on success (or return the value, if you specified "return"),
--1 on failure. 
+```insert-new``` will generate an "insert" operation. The C function will
+return 0 on success (or return the value, if you specified "return"), -1 on
+failure. 
 ```
 %query example() {
-    type insert
+    type insert-new
+    table example
+    // return ...
+    // callback ...
+}
+```
+```insert-or-get``` will generate either a "insert or get" operation (if you
+also specify a "return" or "callback" statement, or a "insert or ignore"
+operation. The C function will return 0 on success (or return the value, if you
+specified "return"), -1 on failure. 
+```
+%query example() {
+    type insert-or-get
     table example
     // return ...
     // callback ...
@@ -405,8 +416,13 @@ will return 0 on success (or return the value, if you specified "return"),
 "insert or get" operation, because in the case of the value already existing,
 the existing value is modified and returned, whereas with the "insert or get"
 operation, the existing value is returned un-modified.
+**NOTE**: In order for upsert to work properly, you must enforce constraints
+when creating the table. In the example below, UNIQUE is being used to ensure
+there can only be one of each value. If you do not do this, then the value will
+just be inserted anyway, even if there is an existing value.
 ```
-%query example() {
+-- Assuming: CREATE TABLE example (value INTEGER UNIQUE);
+%query example(int value) {
     type upsert
     table example
     // return ...

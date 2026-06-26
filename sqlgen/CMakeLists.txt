@@ -7,6 +7,9 @@ project ("sqlgen"
 add_executable (sqlgen
     "sqlgen.c")
 
+target_compile_options(sqlgen PRIVATE -fno-sanitize=address)
+target_link_options(sqlgen PRIVATE -fno-sanitize=address)
+
 macro (sqlgen_target name)
     set (sqlgen_target_PARAM_OPTIONS)
     set (sqlgen_target_PARAM_ONE_VALUE_KEYWORDS
