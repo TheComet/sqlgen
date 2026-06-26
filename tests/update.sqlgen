@@ -108,13 +108,19 @@
     type update name, age
     table people
 }
-%query valid,select_all() {
-    type select-all
+%query valid,update_all_ages_cb(int age) {
+    type update age
     table people
     callback int id, const char* name, int age
 }
-%query valid,update_all_ages_cb(int age) {
+%query valid,update_all_ages_cb_returning_id(int age) {
     type update age
+    table people
+    callback int id, const char* name, int age
+    return id
+}
+%query valid,select_all() {
+    type select-all
     table people
     callback int id, const char* name, int age
 }

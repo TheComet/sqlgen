@@ -1,5 +1,6 @@
 %option prefix="mydb"
 //%option debug-layer
+%option forwards-compat
 
 %header-preamble {
     #include <stdint.h>

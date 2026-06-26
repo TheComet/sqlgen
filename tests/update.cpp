@@ -261,3 +261,18 @@ TEST_F(NAME, update_all_ages_cb_iterate_all)
     ASSERT_THAT(counter, Eq(2));
     ASSERT_THAT(dbi->valid.select_all(db, check_rows_2, NULL), Eq(0));
 }
+
+TEST_F(NAME, update_all_ages_cb_returning_id_iterate_one)
+{
+    int counter = 0;
+    ASSERT_THAT(dbi->valid.update_all_ages_cb_returning_id(db, 420, on_person_one, &counter), Eq(1));
+    ASSERT_THAT(counter, Eq(1));
+    ASSERT_THAT(dbi->valid.select_all(db, check_rows_2, NULL), Eq(0));
+}
+TEST_F(NAME, update_all_ages_cb_returning_id_iterate_all)
+{
+    int counter = 0;
+    ASSERT_THAT(dbi->valid.update_all_ages_cb_returning_id(db, 420, on_person_all, &counter), Eq(2));
+    ASSERT_THAT(counter, Eq(2));
+    ASSERT_THAT(dbi->valid.select_all(db, check_rows_2, NULL), Eq(0));
+}

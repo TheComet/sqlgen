@@ -109,7 +109,7 @@ mfile_map_read(struct mfile* mf, const char* file_path, int silence_open_error)
     HANDLE hFile;
     LARGE_INTEGER liFileSize;
     HANDLE mapping;
-    wchar_t* utf16_filename;
+    wchar_t* utf16_file_path;
 
     utf16_file_path = utf8_to_utf16(file_path, (int)strlen(file_path));
     if (utf16_file_path == NULL)
@@ -220,7 +220,7 @@ mfile_map_write(struct mfile* mf, const char* file_path, int size)
 #if defined(WIN32)
     HANDLE hFile;
     HANDLE mapping;
-    wchar_t* utf16_filename;
+    wchar_t* utf16_file_path;
 
     utf16_file_path = utf8_to_utf16(file_path, (int)strlen(file_path));
     if (utf16_file_path == NULL)
